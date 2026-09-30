@@ -61,5 +61,22 @@ class TransferIn(BaseModel):
     idempotency_key: str | None = None
 
 
+class TradeOrderIn(BaseModel):
+    seller_id: int
+    buyer_id: int
+    year: int
+    amount: float = Field(gt=0)
+    price: float = Field(default=0, ge=0)
+    # 发起方：seller=卖方挂单 / buyer=买方求购，发起方建单即视为已确认
+    initiator: str = Field(default="seller", pattern="^(seller|buyer)$")
+    tx_date: str = ""
+    remark: str = ""
+    idempotency_key: str | None = None
+
+
+class TradeOrderCancelIn(BaseModel):
+    reason: str = Field(default="", max_length=256)
+
+
 class ReportReversalIn(BaseModel):
     reason: str = Field(min_length=2, max_length=500)

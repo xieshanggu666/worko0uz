@@ -3,6 +3,7 @@ from app.models.allowance import (
     AllowanceTransaction,
     ComplianceRecord,
     Quota,
+    TradeOrder,
 )
 from app.models.company import Company, EmissionScope
 from app.models.emission import (
@@ -28,5 +29,6 @@ __all__ = [
     "AllowanceAccount",
     "AllowanceTransaction",
     "ComplianceRecord",
+    "TradeOrder",
     "MrvReport",
 ]

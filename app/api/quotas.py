@@ -57,7 +57,11 @@ def company_account(company_id: int, year: int, db: Session = Depends(get_db), u
         "opening_balance": float(account.opening_balance),
         "current_balance": float(account.current_balance),
         "frozen_balance": float(account.frozen_balance),
-        "available_balance": float(account.current_balance) - float(account.frozen_balance),
+        "reserved_balance": float(getattr(account, "reserved_balance", 0) or 0),
+        # 自由可用 = 持仓 - 履约冻结 - 交易占用（已确认待交割订单）
+        "available_balance": float(account.current_balance)
+        - float(account.frozen_balance)
+        - float(getattr(account, "reserved_balance", 0) or 0),
     }
 
 
@@ -112,6 +116,8 @@ def account_transactions(account_id: int, db: Session = Depends(get_db), user: U
             "tx_date": t.tx_date,
             "balance_after": float(t.balance_after),
             "frozen_after": float(t.frozen_after or 0),
+            "reserved_after": float(getattr(t, "reserved_after", 0) or 0),
+            "trade_order_id": getattr(t, "trade_order_id", None),
             "remark": t.remark,
         }
         for t in txs

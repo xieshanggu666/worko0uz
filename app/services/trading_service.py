@@ -14,7 +14,7 @@ from app.core.ledger import (
     account_lock_key,
     apply_ledger_delta,
     is_duplicate_submit,
-    lock_rows_for_update,
+    lock_row_for_write,
     locked_accounts,
     transactional,
 )
@@ -62,16 +62,23 @@ def transfer(
 
         try:
             with transactional(db):
-                lock_rows_for_update(db, account.id)
-                account = db.get(AllowanceAccount, account.id)
+                # 抢占账户行写锁后读到的可用余额在提交前不会被并发清缴/订单改动
+                account = lock_row_for_write(db, account.id)
                 delta = amount if tx_type in _INCREASE_TYPES else -amount
-                # 原子条件 UPDATE：最终余额与冻结额由数据库计算。卖出/划出只能使用
-                # current - frozen 的可用部分，报告批准冻结的履约配额不得被交易占用。
+                # 原子条件 UPDATE：最终余额、冻结额与占用额由数据库计算。卖出/划出只能使用
+                # current - frozen - reserved 的自由可用部分；报告批准冻结的履约配额与
+                # 已确认订单占用的交易配额均不得被重复卖出。
                 if delta < 0:
-                    available = float(account.current_balance) - float(account.frozen_balance)
+                    available = (
+                        float(account.current_balance)
+                        - float(account.frozen_balance)
+                        - float(account.reserved_balance)
+                    )
                     if round(available, 4) < amount:
                         raise InsufficientBalanceError("可用配额余额不足")
-                balance_after, frozen_after = apply_ledger_delta(db, account.id, delta, 0)
+                balance_after, frozen_after, reserved_after = apply_ledger_delta(
+                    db, account.id, delta, 0, 0
+                )
 
                 tx = AllowanceTransaction(
                     account_id=account.id,
@@ -83,6 +90,7 @@ def transfer(
                     tx_date=tx_date,
                     balance_after=balance_after,
                     frozen_after=frozen_after,
+                    reserved_after=reserved_after,
                     remark=remark,
                     idempotency_key=idempotency_key,
                 )
@@ -92,7 +100,7 @@ def transfer(
                 db.refresh(account)
                 db.refresh(tx)
         except InsufficientBalanceError:
-            raise ValueError("配额余额不足")
+            raise ValueError("可用配额余额不足")
         except Exception as exc:
             # 与并发的首笔请求撞幂等键时回滚并返回首笔流水，视为重复提交
             if idempotency_key and is_duplicate_submit(exc):

@@ -2,8 +2,10 @@
 
 用法：python scripts/migrate_concurrency.py（可重复执行）
 
-- allowance_transactions：idempotency_key、frozen_after
+- allowance_transactions：idempotency_key、frozen_after、reserved_after、trade_order_id
+- allowance_accounts：reserved_balance（企业间订单交易占用）
 - compliance_records：idempotency_key、frozen_amount、report_id、is_active
+- trade_orders：企业间交易订单新表（建表由 SQLAlchemy 元数据完成，存在则跳过）
 - mrv_reports：reversed_by/reversed_at/reversal_reason
 - 活跃履约记录保持 (company_id, year) 唯一；冲正归档记录可重新批准
 """
@@ -16,6 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import inspect, text  # noqa: E402
 
 from app.core.database import engine  # noqa: E402
+# 触发模型注册，使 trade_orders 进入 metadata.create_all
+from app.core.database import Base  # noqa: E402
+from app.models import TradeOrder  # noqa: F401,E402
 
 
 def _has_column(inspector, table: str, column: str) -> bool:
@@ -40,6 +45,23 @@ def main():
     statements: list[str] = []
     tables = set(inspector.get_table_names())
 
+    # 新表（trade_orders）：create_all 只创建缺失表，不影响已有表的数据与结构
+    created_before = set(inspect(engine).get_table_names())
+    Base.metadata.create_all(engine)
+    created_after = set(inspect(engine).get_table_names())
+    new_tables = sorted(created_after - created_before)
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+
+    if "allowance_accounts" in tables:
+        _add_column(
+            statements,
+            inspector,
+            "allowance_accounts",
+            "reserved_balance",
+            "reserved_balance NUMERIC(18, 4) NOT NULL DEFAULT 0",
+        )
+
     if "allowance_transactions" in tables:
         _add_column(
             statements,
@@ -54,6 +76,20 @@ def main():
             "allowance_transactions",
             "frozen_after",
             "frozen_after NUMERIC(18, 4) NOT NULL DEFAULT 0",
+        )
+        _add_column(
+            statements,
+            inspector,
+            "allowance_transactions",
+            "reserved_after",
+            "reserved_after NUMERIC(18, 4) NOT NULL DEFAULT 0",
+        )
+        _add_column(
+            statements,
+            inspector,
+            "allowance_transactions",
+            "trade_order_id",
+            "trade_order_id INTEGER",
         )
         if not _has_index(inspector, "uq_tx_account_idem"):
             # SQLite 中 NULL 不参与唯一索引，未携带幂等键的历史/新请求不受影响
@@ -121,7 +157,9 @@ def main():
         for stmt in statements:
             print(f"执行：{stmt}")
             conn.execute(text(stmt))
-    print(f"迁移完成：{len(statements)} 项变更")
+    if new_tables:
+        print(f"新建表：{', '.join(new_tables)}")
+    print(f"迁移完成：{len(statements)} 项变更，{len(new_tables)} 张新表")
 
 
 if __name__ == "__main__":

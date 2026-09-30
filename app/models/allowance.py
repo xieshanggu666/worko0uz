@@ -46,6 +46,7 @@ class AllowanceAccount(Base):
     opening_balance = Column(Numeric(18, 4), nullable=False, default=0)
     current_balance = Column(Numeric(18, 4), nullable=False, default=0)
     frozen_balance = Column(Numeric(18, 4), nullable=False, default=0)   # 履约冻结
+    reserved_balance = Column(Numeric(18, 4), nullable=False, default=0)  # 交易占用（已确认待交割订单）
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -62,13 +63,17 @@ class AllowanceTransaction(Base):
     id = Column(Integer, primary_key=True)
     account_id = Column(Integer, ForeignKey("allowance_accounts.id"), nullable=False, index=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
-    tx_type = Column(String(24), nullable=False)   # allocation/buy/sell/transfer_in/transfer_out/freeze/clear/frozen_clear/offset/reversal
+    # allocation/buy/sell/transfer_in/transfer_out/freeze/clear/frozen_clear/offset/reversal/
+    # trade_reserve/trade_release/trade_deliver_out/trade_deliver_in
+    tx_type = Column(String(24), nullable=False)
     amount = Column(Numeric(18, 4), nullable=False, default=0)
     counterparty = Column(String(128), nullable=False, default="")
     price = Column(Numeric(18, 2), nullable=True)
     tx_date = Column(String(10), nullable=False, default="")
     balance_after = Column(Numeric(18, 4), nullable=False, default=0)
     frozen_after = Column(Numeric(18, 4), nullable=False, default=0)
+    reserved_after = Column(Numeric(18, 4), nullable=False, default=0)  # 交易占用快照
+    trade_order_id = Column(Integer, ForeignKey("trade_orders.id"), nullable=True, index=True)  # 关联企业间订单
     remark = Column(String(256), nullable=False, default="")
     idempotency_key = Column(String(64), nullable=True)  # 客户端去重键（UUID），同账户唯一
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -104,3 +109,43 @@ class ComplianceRecord(Base):
     is_active = Column(Integer, nullable=False, default=1)                 # 0=报告冲正后归档，重新批准可建新记录
     idempotency_key = Column(String(64), nullable=True)  # 清缴请求去重键（全局唯一）
     cleared_at = Column(DateTime, nullable=True)
+
+
+class TradeOrder(Base):
+    """企业间配额交易订单：双方确认 → 卖方占用 → 交割划转 → 撤销释放。
+
+    状态机：
+    - pending：一方挂单，发起方默认已确认，等待对方确认（不占用任何配额）；
+    - confirmed：双方均确认，卖方账户把对应数量从“可用”转为交易占用 reserved；
+    - delivered：已交割，占用配额离开卖方持仓、买方入账，双方各留流水；
+    - cancelled：交割前任一方撤销（或对方拒绝），释放卖方交易占用，不再可流转。
+    """
+
+    __tablename__ = "trade_orders"
+    __table_args__ = (
+        # 建单请求幂等：同一客户端重复提交（双击/重试）只生成一张订单。
+        # NULL 不参与唯一约束，未携带幂等键的请求不受影响。
+        UniqueConstraint("idempotency_key", name="uq_trade_order_idem"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    order_no = Column(String(32), nullable=False, unique=True, index=True)
+    year = Column(Integer, nullable=False, index=True)
+    seller_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    buyer_id = Column(Integer, ForeignKey("companies.id"), nullable=False, index=True)
+    amount = Column(Numeric(18, 4), nullable=False)             # 交易量（tCO2）
+    price = Column(Numeric(18, 2), nullable=False, default=0)   # 单价（元/t）
+    status = Column(String(16), nullable=False, default="pending", index=True)  # pending/confirmed/delivered/cancelled
+    seller_confirmed = Column(Integer, nullable=False, default=0)
+    buyer_confirmed = Column(Integer, nullable=False, default=0)
+    # 发起方：seller=卖方挂单，buyer=买方求购；用于建单时自动确认发起方
+    initiator = Column(String(8), nullable=False, default="seller")
+    tx_date = Column(String(10), nullable=False, default="")
+    remark = Column(String(256), nullable=False, default="")
+    cancel_reason = Column(String(256), nullable=False, default="")
+    cancelled_by = Column(Integer, ForeignKey("companies.id"), nullable=True)
+    idempotency_key = Column(String(64), nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

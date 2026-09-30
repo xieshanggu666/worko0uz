@@ -19,9 +19,10 @@ from app.core.ledger import (
     InsufficientBalanceError,
     account_lock_key,
     apply_ledger_delta,
+    atomic_available_debit,
     company_clear_key,
     is_duplicate_submit,
-    lock_rows_for_update,
+    lock_row_for_write,
     locked_accounts,
     transactional,
 )
@@ -60,6 +61,9 @@ def _add_ledger_tx(
     remark: str,
     tx_date: str | None = None,
     idempotency_key: str | None = None,
+    reserved_after: float | None = None,
+    trade_order_id: int | None = None,
+    price: float | None = None,
 ) -> AllowanceTransaction:
     tx = AllowanceTransaction(
         account_id=account.id,
@@ -67,10 +71,12 @@ def _add_ledger_tx(
         tx_type=tx_type,
         amount=round(amount, 4),
         counterparty=counterparty,
-        price=None,
+        price=round(price, 2) if price is not None else None,
         tx_date=tx_date or _today(),
         balance_after=round(balance_after, 4),
         frozen_after=round(frozen_after, 4),
+        reserved_after=round(reserved_after if reserved_after is not None else account.reserved_balance, 4),
+        trade_order_id=trade_order_id,
         remark=remark,
         idempotency_key=idempotency_key,
     )
@@ -129,8 +135,8 @@ def allocate_quota(
 
                 if account:
                     # 已存在账户：原子加记配额与期初值
-                    lock_rows_for_update(db, account.id)
-                    balance_after, frozen_after = apply_ledger_delta(db, account.id, total, 0)
+                    account = lock_row_for_write(db, account.id)
+                    balance_after, frozen_after, reserved_after = apply_ledger_delta(db, account.id, total, 0, 0)
                     db.execute(
                         update(AllowanceAccount)
                         .where(AllowanceAccount.id == account.id)
@@ -250,18 +256,22 @@ def freeze_allowance_for_report(
                 remaining_obligation = round(emission - already_cleared, 4)
 
                 frozen = 0.0
-                balance_after = frozen_after = 0.0
+                balance_after = frozen_after = reserved_after = 0.0
                 if account and remaining_obligation > 0:
-                    lock_rows_for_update(db, account.id)
-                    account = db.get(AllowanceAccount, account.id)
+                    account = lock_row_for_write(db, account.id)
+                    # 履约冻结只能使用真正未占用的配额：已被确认中订单占用的
+                    # 交易配额（reserved）不得再被冻结，反之亦然。
                     available = round(
-                        float(account.current_balance) - float(account.frozen_balance), 4
+                        float(account.current_balance)
+                        - float(account.frozen_balance)
+                        - float(account.reserved_balance),
+                        4,
                     )
                     to_freeze = round(max(remaining_obligation - already_frozen, 0.0), 4)
                     frozen = round(min(max(available, 0.0), to_freeze), 4)
                     if frozen > 0:
-                        balance_after, frozen_after = apply_ledger_delta(
-                            db, account.id, 0, frozen
+                        balance_after, frozen_after, reserved_after = apply_ledger_delta(
+                            db, account.id, 0, frozen, 0
                         )
                         _add_ledger_tx(
                             db,
@@ -272,10 +282,12 @@ def freeze_allowance_for_report(
                             frozen_after,
                             "MRV批准冻结",
                             f"{year}年度报告批准，冻结履约配额 {frozen} 吨",
+                            reserved_after=reserved_after,
                         )
                     else:
                         balance_after = float(account.current_balance)
                         frozen_after = float(account.frozen_balance)
+                        reserved_after = float(account.reserved_balance)
 
                 total_frozen = round(already_frozen + frozen, 4)
                 record.frozen_amount = total_frozen
@@ -364,14 +376,15 @@ def reverse_approved_report(
 
         try:
             with transactional(db):
-                balance_after = frozen_after = 0.0
+                balance_after = frozen_after = reserved_after = 0.0
                 if refund > 0:
                     if account is None:
                         raise ValueError("配额账户缺失，无法安全退还配额，冲正已中止")
-                    lock_rows_for_update(db, account.id)
+                    lock_row_for_write(db, account.id)
                     # 冻结部分转回可用；已清缴部分曾离开持仓，需重新入账。
-                    balance_after, frozen_after = apply_ledger_delta(
-                        db, account.id, refund, -frozen
+                    # 交易占用（reserved）不受影响，退还的配额成为可交易的自由配额。
+                    balance_after, frozen_after, reserved_after = apply_ledger_delta(
+                        db, account.id, refund, -frozen, 0
                     )
                     _add_ledger_tx(
                         db,
@@ -382,6 +395,7 @@ def reverse_approved_report(
                         frozen_after,
                         "报告冲正",
                         f"{year}年度报告冲正：解冻{frozen}吨，退还清缴{cleared}吨",
+                        reserved_after=reserved_after,
                     )
 
                 record.is_active = 0
@@ -478,19 +492,21 @@ def clear_emission(
                 frozen_available = round(float(record.frozen_amount), 4) if record else 0.0
                 frozen_use = round(min(frozen_available, remaining), 4)
                 current_use = 0.0
-                balance_after = frozen_after = 0.0
+                balance_after = frozen_after = reserved_after = 0.0
 
                 if account:
-                    lock_rows_for_update(db, account.id)
-                    account = db.get(AllowanceAccount, account.id)
+                    # 进入写事务即抢占账户行写锁：随后读到的可用余额在提交前不会被
+                    # 并发卖出/订单交割改变，清缴“预算 → 扣减”不再有 TOCTOU 窗口。
+                    account = lock_row_for_write(db, account.id)
                     balance_after = float(account.current_balance)
                     frozen_after = float(account.frozen_balance)
+                    reserved_after = float(account.reserved_balance)
 
                 if frozen_use > 0:
                     if account is None:
                         raise ValueError("冻结配额对应账户缺失，清缴已中止")
-                    balance_after, frozen_after = apply_ledger_delta(
-                        db, account.id, -frozen_use, -frozen_use
+                    balance_after, frozen_after, reserved_after = apply_ledger_delta(
+                        db, account.id, -frozen_use, -frozen_use, 0
                     )
                     _add_ledger_tx(
                         db,
@@ -502,19 +518,18 @@ def clear_emission(
                         "履约清缴",
                         f"{year}年度冻结配额履约清缴 {frozen_use} 吨",
                         tx_date=deadline,
+                        reserved_after=reserved_after,
                     )
 
                 still_remaining = round(remaining - frozen_use, 4)
                 if still_remaining > 0 and account:
-                    account = db.get(AllowanceAccount, account.id)
-                    available = round(
-                        float(account.current_balance) - float(account.frozen_balance), 4
+                    # 清缴补扣只能使用自由可用配额，已确认订单占用的交易配额不得被清缴挪用。
+                    # 实扣额由数据库在写锁内按 min(剩余缺口, 自由可用) 原子计算，
+                    # 无需“先读余额做预算”，从根本上消除与并发卖出之间的 TOCTOU 竞态。
+                    current_use, balance_after, frozen_after, reserved_after = atomic_available_debit(
+                        db, account.id, still_remaining
                     )
-                    current_use = round(min(max(available, 0.0), still_remaining), 4)
                     if current_use > 0:
-                        balance_after, frozen_after = apply_ledger_delta(
-                            db, account.id, -current_use, 0
-                        )
                         _add_ledger_tx(
                             db,
                             account,
@@ -526,6 +541,7 @@ def clear_emission(
                             f"{year}年度可用配额履约清缴 {current_use} 吨",
                             tx_date=deadline,
                             idempotency_key=idempotency_key,
+                            reserved_after=reserved_after,
                         )
 
                 deducted = round(frozen_use + current_use, 4)

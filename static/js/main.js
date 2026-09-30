@@ -14,6 +14,7 @@ const TITLES = {
   factors: "排放因子库",
   calculation: "排放核算",
   quotas: "配额与交易",
+  orders: "企业间订单",
   reports: "MRV 报告",
 };
 
@@ -24,6 +25,7 @@ const NAV = [
   ["factors", "排放因子"],
   ["calculation", "排放核算"],
   ["quotas", "配额与交易"],
+  ["orders", "企业间订单"],
   ["reports", "MRV 报告"],
 ];
 
@@ -86,6 +88,7 @@ function AppShell() {
   else if (path === "factors") view = html`<${views.FactorsView} />`;
   else if (path === "calculation") view = html`<${views.CalculationView} />`;
   else if (path === "quotas") view = html`<${views.QuotaView} />`;
+  else if (path === "orders") view = html`<${views.TradeOrdersView} />`;
   else if (path === "reports") view = html`<${views.ReportsView} />`;
   else view = html`<${views.DashboardView} />`;
 

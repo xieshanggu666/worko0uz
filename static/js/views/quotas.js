@@ -137,8 +137,9 @@ views.QuotaView = () => {
         <div class="cards">
           <div class="card"><div class="label">期初配额</div><div class="value">${fmtNum(account.opening_balance)} t</div></div>
           <div class="card"><div class="label">当前持仓</div><div class="value">${fmtNum(account.current_balance)} t</div></div>
-          <div class="card"><div class="label">冻结配额</div><div class="value">${fmtNum(account.frozen_balance)} t</div></div>
-          <div class="card"><div class="label">可用余额</div><div class="value">${fmtNum(account.available_balance)} t</div></div>
+          <div class="card"><div class="label">履约冻结</div><div class="value">${fmtNum(account.frozen_balance)} t</div></div>
+          <div class="card"><div class="label">交易占用</div><div class="value">${fmtNum(account.reserved_balance || 0)} t</div></div>
+          <div class="card"><div class="label">自由可用</div><div class="value">${fmtNum(account.available_balance)} t</div></div>
         </div>
         <form class="form-grid" onSubmit=${doTransfer}>
           <div class="field"><label>类型</label>
@@ -155,7 +156,7 @@ views.QuotaView = () => {
           <div class="actions"><button class="btn" type="submit" disabled=${submitting}>${submitting ? "提交中…" : "提交交易"}</button></div>
         </form>
         <table style=${{marginTop: "16px"}}>
-          <thead><tr><th>ID</th><th>类型</th><th>数量 (t)</th><th>对手方</th><th>单价</th><th>日期</th><th>持仓</th><th>冻结</th><th>备注</th></tr></thead>
+          <thead><tr><th>ID</th><th>类型</th><th>数量 (t)</th><th>对手方</th><th>单价</th><th>日期</th><th>持仓</th><th>履约冻结</th><th>交易占用</th><th>备注</th></tr></thead>
           <tbody>
             ${txs.map((t) => html`
               <tr key=${t.id}>
@@ -167,9 +168,10 @@ views.QuotaView = () => {
                 <td>${t.tx_date || "-"}</td>
                 <td>${fmtNum(t.balance_after)}</td>
                 <td>${fmtNum(t.frozen_after)}</td>
+                <td>${fmtNum(t.reserved_after || 0)}</td>
                 <td>${t.remark || "-"}</td>
               </tr>`)}
-            ${txs.length === 0 && html`<tr><td colspan="9" class="empty">暂无交易记录</td></tr>`}
+            ${txs.length === 0 && html`<tr><td colspan="10" class="empty">暂无交易记录</td></tr>`}
           </tbody>
         </table>` : html`<div class="msg err">${msg.text || "该年度尚无配额账户，请先分配配额"}</div>`}
     </div>

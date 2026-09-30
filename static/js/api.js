@@ -63,4 +63,15 @@ const txLabel = {
   frozen_clear: "冻结清缴",
   reversal: "报告冲正退还",
   clear: "履约清缴",
+  trade_reserve: "订单交易占用",
+  trade_release: "撤销释放占用",
+  trade_deliver_out: "订单交割划出",
+  trade_deliver_in: "订单交割受让",
+};
+
+const orderStatusMap = {
+  pending: ["warn", "待对方确认"],
+  confirmed: ["info", "双方已确认"],
+  delivered: ["ok", "已交割"],
+  cancelled: ["muted", "已撤销"],
 };

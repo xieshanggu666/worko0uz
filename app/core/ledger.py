@@ -48,6 +48,11 @@ def company_clear_key(company_id: int, year: int) -> str:
     return f"clear:{company_id}:{year}"
 
 
+def trade_order_key(order_id: int) -> str:
+    """企业间订单键：订单状态机（确认/撤销/交割）的进程内串行化。"""
+    return f"order:{order_id}"
+
+
 def _get_lock(key: str) -> threading.RLock:
     with _locks_guard:
         lock = _locks.get(key)
@@ -107,25 +112,40 @@ def apply_ledger_delta(
     account_id: int,
     current_delta: float = 0,
     frozen_delta: float = 0,
-) -> tuple[float, float]:
-    """原子更新账户当前余额与履约冻结额，返回更新后的 ``(当前余额, 冻结额)``。
+    reserved_delta: float = 0,
+) -> tuple[float, float, float]:
+    """原子更新账户当前余额、履约冻结额与交易占用额。
 
-    数据库条件同时保证：当前余额非负、冻结额非负、冻结额不超过当前余额。
-    因此交易校验的是“可用余额（current - frozen）”，报告批准后的冻结配额
-    不能再被卖出或划出；冻结、清缴、冲正在并发下也不会破坏账本不变量。
+    返回更新后的 ``(当前余额, 冻结额, 占用额)``。
+
+    数据库条件同时保证：
+    - 当前余额非负；
+    - 冻结额、占用额各自非负；
+    - ``current >= frozen + reserved``：履约冻结与交易占用互不挤占，
+      报告批准冻结的配额不能被订单占用，已确认订单占用的配额也不能被冻结/清缴挪用。
+
+    因此交易校验的是“可用余额（current - frozen - reserved）”，任何一方
+    在并发下都不会破坏账本不变量。
     """
     current_amount = round(current_delta, 4)
     frozen_amount = round(frozen_delta, 4)
+    reserved_amount = round(reserved_delta, 4)
     current_expr = AllowanceAccount.current_balance + current_amount
     frozen_expr = AllowanceAccount.frozen_balance + frozen_amount
+    reserved_expr = AllowanceAccount.reserved_balance + reserved_amount
 
     stmt = (
         update(AllowanceAccount)
         .where(AllowanceAccount.id == account_id)
         .where(current_expr >= 0)
         .where(frozen_expr >= 0)
-        .where(current_expr >= frozen_expr)
-        .values(current_balance=current_expr, frozen_balance=frozen_expr)
+        .where(reserved_expr >= 0)
+        .where(current_expr >= frozen_expr + reserved_expr)
+        .values(
+            current_balance=current_expr,
+            frozen_balance=frozen_expr,
+            reserved_balance=reserved_expr,
+        )
     )
     result = db.execute(stmt.execution_options(synchronize_session=False))
     if result.rowcount != 1:
@@ -134,7 +154,11 @@ def apply_ledger_delta(
     db.expire_all()
     db.flush()
     refreshed = db.get(AllowanceAccount, account_id)
-    return round(float(refreshed.current_balance), 4), round(float(refreshed.frozen_balance), 4)
+    return (
+        round(float(refreshed.current_balance), 4),
+        round(float(refreshed.frozen_balance), 4),
+        round(float(refreshed.reserved_balance), 4),
+    )
 
 
 def apply_balance_delta(
@@ -143,8 +167,75 @@ def apply_balance_delta(
     delta: float,
 ) -> float:
     """对账户当前余额执行单条原子条件 UPDATE，返回更新后的余额。"""
-    balance, _ = apply_ledger_delta(db, account_id, current_delta=delta)
+    balance, _, _ = apply_ledger_delta(db, account_id, current_delta=delta)
     return balance
+
+
+def lock_row_for_write(db: Session, account_id: int) -> AllowanceAccount:
+    """在写事务内抢占账户行的数据库写锁，并返回锁内最新的账户对象。
+
+    SQLite 的写锁为库级锁：事务内对该行执行一次“空更新”（SET id=id）即升级为
+    保留写锁（Reserved Lock），此后本事务读到的就是锁内最新值，且在提交前不会被
+    其它事务的提交改动——配合随后的扣减 UPDATE，彻底关闭
+    “读余额做预算 → 写入”之间的 TOCTOU 窗口。
+
+    PostgreSQL/MySQL 则直接使用 SELECT ... FOR UPDATE 行锁。
+    """
+    if db.bind is not None and db.bind.dialect.name != "sqlite":
+        db.query(AllowanceAccount.id).filter(AllowanceAccount.id == account_id).with_for_update().first()
+    else:
+        db.execute(
+            update(AllowanceAccount)
+            .where(AllowanceAccount.id == account_id)
+            .values(id=AllowanceAccount.id)
+            .execution_options(synchronize_session=False)
+        )
+    db.expire_all()
+    return db.get(AllowanceAccount, account_id)
+
+
+def atomic_available_debit(
+    db: Session,
+    account_id: int,
+    wanted: float,
+    also_reserve: bool = False,
+) -> tuple[float, float, float, float]:
+    """尽力而为地从“自由可用余额”中原子扣减，返回 ``(实扣, 最新余额, 冻结, 占用)``。
+
+    实扣额 = min(wanted, current - frozen - reserved)。调用前须已在写事务内通过
+    :func:`lock_row_for_write` 抢占该行写锁（调用方通常已持有进程内账户键锁），
+    因此读到的可用余额在本事务提交前不会被并发提交改变：预算与扣减之间不存在
+    TOCTOU 窗口，扣减 UPDATE 的数据库条件仅作为最后的兜底防线。
+
+    - also_reserve=False：普通出库（清缴补扣），只减 current；
+    - also_reserve=True：交易占用出库（订单交割），current 与 reserved 同减。
+    """
+    wanted = round(wanted, 4)
+    account = db.get(AllowanceAccount, account_id)
+    available = round(
+        float(account.current_balance)
+        - float(account.frozen_balance)
+        - float(account.reserved_balance),
+        4,
+    )
+    debit = round(min(max(available, 0.0), wanted), 4)
+    if debit <= 0:
+        return (
+            0.0,
+            round(float(account.current_balance), 4),
+            round(float(account.frozen_balance), 4),
+            round(float(account.reserved_balance), 4),
+        )
+
+    if also_reserve:
+        balance_after, frozen_after, reserved_after = apply_ledger_delta(
+            db, account_id, -debit, 0, -debit
+        )
+    else:
+        balance_after, frozen_after, reserved_after = apply_ledger_delta(
+            db, account_id, -debit, 0, 0
+        )
+    return debit, balance_after, frozen_after, reserved_after
 
 
 def is_duplicate_submit(exc: IntegrityError, column: str = "idempotency_key") -> bool:
