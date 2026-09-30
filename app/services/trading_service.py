@@ -65,13 +65,18 @@ def transfer(
                 lock_rows_for_update(db, account.id)
                 account = db.get(AllowanceAccount, account.id)
                 delta = amount if tx_type in _INCREASE_TYPES else -amount
-                # 原子条件 UPDATE：最终余额与冻结额由数据库计算。卖出/划出只能使用
-                # current - frozen 的可用部分，报告批准冻结的履约配额不得被交易占用。
+                # 原子条件 UPDATE：最终余额由数据库计算。卖出/划出只能使用
+                # current - frozen - held 的可用部分；履约冻结与企业间订单占用
+                # 的配额都不得再被卖出。
                 if delta < 0:
-                    available = float(account.current_balance) - float(account.frozen_balance)
+                    available = (
+                        float(account.current_balance)
+                        - float(account.frozen_balance)
+                        - float(account.trade_held_balance)
+                    )
                     if round(available, 4) < amount:
                         raise InsufficientBalanceError("可用配额余额不足")
-                balance_after, frozen_after = apply_ledger_delta(db, account.id, delta, 0)
+                balance_after, _, _ = apply_ledger_delta(db, account.id, delta, 0)
 
                 tx = AllowanceTransaction(
                     account_id=account.id,
@@ -82,7 +87,8 @@ def transfer(
                     price=round(price, 2) if price is not None else None,
                     tx_date=tx_date,
                     balance_after=balance_after,
-                    frozen_after=frozen_after,
+                    frozen_after=account.frozen_balance,
+                    trade_held_after=account.trade_held_balance,
                     remark=remark,
                     idempotency_key=idempotency_key,
                 )
@@ -92,7 +98,7 @@ def transfer(
                 db.refresh(account)
                 db.refresh(tx)
         except InsufficientBalanceError:
-            raise ValueError("配额余额不足")
+            raise ValueError("可用配额余额不足")
         except Exception as exc:
             # 与并发的首笔请求撞幂等键时回滚并返回首笔流水，视为重复提交
             if idempotency_key and is_duplicate_submit(exc):

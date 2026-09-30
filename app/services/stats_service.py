@@ -51,6 +51,7 @@ def dashboard_stats(db: Session, year: int | None = None, user: User | None = No
     account_query = company_filtered(db.query(AllowanceAccount), AllowanceAccount)
     current_total = sum_column(AllowanceAccount, AllowanceAccount.current_balance)
     frozen_total = sum_column(AllowanceAccount, AllowanceAccount.frozen_balance)
+    trade_held_total = sum_column(AllowanceAccount, AllowanceAccount.trade_held_balance)
 
     account_id_query = db.query(AllowanceAccount.id)
     if company_ids is not None:
@@ -73,8 +74,11 @@ def dashboard_stats(db: Session, year: int | None = None, user: User | None = No
         "quota_total": round(float(quota_total), 4),
         "cleared_total": round(float(cleared_total), 4),
         "frozen_total": round(float(frozen_total), 4),
+        "trade_held_total": round(float(trade_held_total), 4),
         "current_balance_total": round(float(current_total), 4),
-        "available_total": round(float(current_total) - float(frozen_total), 4),
+        "available_total": round(
+            float(current_total) - float(frozen_total) - float(trade_held_total), 4
+        ),
         "transaction_count": tx_query.count(),
         "compliance_counts": {"compliant": compliant, "deficit": deficit, "pending": pending},
         "accounts": account_query.count(),

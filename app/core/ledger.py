@@ -48,6 +48,11 @@ def company_clear_key(company_id: int, year: int) -> str:
     return f"clear:{company_id}:{year}"
 
 
+def trade_order_key(order_id: int) -> str:
+    """企业间订单键：同一张订单的确认/撤销/交割串行化。"""
+    return f"trade-order:{order_id}"
+
+
 def _get_lock(key: str) -> threading.RLock:
     with _locks_guard:
         lock = _locks.get(key)
@@ -107,25 +112,39 @@ def apply_ledger_delta(
     account_id: int,
     current_delta: float = 0,
     frozen_delta: float = 0,
-) -> tuple[float, float]:
-    """原子更新账户当前余额与履约冻结额，返回更新后的 ``(当前余额, 冻结额)``。
+    held_delta: float = 0,
+) -> tuple[float, float, float]:
+    """原子更新账户当前余额、履约冻结额与交易占用额。
 
-    数据库条件同时保证：当前余额非负、冻结额非负、冻结额不超过当前余额。
-    因此交易校验的是“可用余额（current - frozen）”，报告批准后的冻结配额
-    不能再被卖出或划出；冻结、清缴、冲正在并发下也不会破坏账本不变量。
+    返回更新后的 ``(当前余额, 履约冻结额, 交易占用额)``。
+
+    数据库条件同时保证：
+    - 当前余额非负、履约冻结额非负、交易占用额非负；
+    - 履约冻结 + 交易占用不超过当前余额。
+
+    因此交易/占用校验的是“可用余额 current - frozen - held”，报告批准后的
+    履约冻结与卖方订单的交易占用互不侵占：已被任一方预留的配额不能再被
+    另一方占用，从数据库层面杜绝“同一批配额既被交易挂单又被履约冻结”。
     """
     current_amount = round(current_delta, 4)
     frozen_amount = round(frozen_delta, 4)
+    held_amount = round(held_delta, 4)
     current_expr = AllowanceAccount.current_balance + current_amount
     frozen_expr = AllowanceAccount.frozen_balance + frozen_amount
+    held_expr = AllowanceAccount.trade_held_balance + held_amount
 
     stmt = (
         update(AllowanceAccount)
         .where(AllowanceAccount.id == account_id)
         .where(current_expr >= 0)
         .where(frozen_expr >= 0)
-        .where(current_expr >= frozen_expr)
-        .values(current_balance=current_expr, frozen_balance=frozen_expr)
+        .where(held_expr >= 0)
+        .where(current_expr >= frozen_expr + held_expr)
+        .values(
+            current_balance=current_expr,
+            frozen_balance=frozen_expr,
+            trade_held_balance=held_expr,
+        )
     )
     result = db.execute(stmt.execution_options(synchronize_session=False))
     if result.rowcount != 1:
@@ -134,7 +153,11 @@ def apply_ledger_delta(
     db.expire_all()
     db.flush()
     refreshed = db.get(AllowanceAccount, account_id)
-    return round(float(refreshed.current_balance), 4), round(float(refreshed.frozen_balance), 4)
+    return (
+        round(float(refreshed.current_balance), 4),
+        round(float(refreshed.frozen_balance), 4),
+        round(float(refreshed.trade_held_balance), 4),
+    )
 
 
 def apply_balance_delta(
@@ -143,7 +166,7 @@ def apply_balance_delta(
     delta: float,
 ) -> float:
     """对账户当前余额执行单条原子条件 UPDATE，返回更新后的余额。"""
-    balance, _ = apply_ledger_delta(db, account_id, current_delta=delta)
+    balance, _, _ = apply_ledger_delta(db, account_id, current_delta=delta)
     return balance
 
 

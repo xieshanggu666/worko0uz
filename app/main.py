@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import activity, auth, calculation, companies, dashboard, factors, quotas, reports
+from app.api import activity, auth, calculation, companies, dashboard, factors, quotas, reports, trade_orders
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "static"
@@ -27,6 +27,7 @@ for router in (
     factors.router,
     calculation.router,
     quotas.router,
+    trade_orders.router,
     reports.router,
     dashboard.router,
 ):

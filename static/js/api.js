@@ -63,4 +63,20 @@ const txLabel = {
   frozen_clear: "冻结清缴",
   reversal: "报告冲正退还",
   clear: "履约清缴",
+  trade_hold: "交易占用",
+  trade_release: "占用释放",
+  trade_sell: "企业间卖出",
+  trade_buy: "企业间买入",
+};
+
+// 企业间交易订单状态徽章
+const TradeStatusBadge = (s) => {
+  const map = {
+    pending_confirmation: ["warn", "待双方确认"],
+    confirmed: ["info", "双方已确认"],
+    delivered: ["ok", "已交割"],
+    cancelled: ["muted", "已撤销"],
+  };
+  const [cls, label] = map[s] || ["muted", s];
+  return `<span class="badge ${cls}">${label}</span>`;
 };

@@ -28,6 +28,11 @@ from app.services.mrv_service import (  # noqa: E402
     submit_report,
 )
 from app.services.quota_service import allocate_quota, clear_emission  # noqa: E402
+from app.services.trade_order_service import (  # noqa: E402
+    confirm_order,
+    create_order,
+    deliver_order,
+)
 from app.services.trading_service import transfer as transfer_allowance  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -94,12 +99,12 @@ def main():
 
     year = 2025
     activities = [
-        # 绿能电力 2025
-        (companies[0].id, scopes[0].id, year, "quarterly", "燃煤消耗", "t", 120000, "燃料领用台账"),
-        (companies[0].id, scopes[1].id, year, "monthly", "外购电力", "MWh", 88000, "电网结算单"),
-        # 恒固水泥 2025
-        (companies[1].id, scopes[2].id, year, "monthly", "熟料产量", "t", 650000, "生产统计月报"),
-        (companies[1].id, scopes[3].id, year, "quarterly", "外购电力", "MWh", 46000, "电网结算单"),
+        # 绿能电力 2025（排放量略高于免费配额，履约时买入缺口补缴，清缴后仍有市场买入余量）
+        (companies[0].id, scopes[0].id, year, "quarterly", "燃煤消耗", "t", 10000, "燃料领用台账"),
+        (companies[0].id, scopes[1].id, year, "monthly", "外购电力", "MWh", 3000, "电网结算单"),
+        # 恒固水泥 2025（工艺排放低于免费配额，批准冻结即足额，清缴后富余可对外出让）
+        (companies[1].id, scopes[2].id, year, "monthly", "熟料产量", "t", 30000, "生产统计月报"),
+        (companies[1].id, scopes[3].id, year, "quarterly", "外购电力", "MWh", 20000, "电网结算单"),
     ]
     for cid, sid, y, period, atype, unit, qty, src in activities:
         db.add(ActivityData(company_id=cid, scope_id=sid, year=y, period=period,
@@ -117,24 +122,42 @@ def main():
         submit_report(db, report)
         approve_report(db, report, verifier_id=users[1].id)
 
-    # 绿能电力冻结后仍有缺口，买入配额后补缴；恒固水泥在批准冻结时即足额
+    # 绿能电力排放量略高于免费配额：首次清缴核销冻结后仍有缺口，
+    # 先从碳市场买入补足缺口并完成补缴（剩余市场买入量形成账户余额）。
     clear_emission(db, companies[0].id, year, f"{year}-12-31")
     elec_account = db.query(AllowanceAccount).filter_by(company_id=companies[0].id, year=year).one()
     elec_record = db.query(ComplianceRecord).filter_by(company_id=companies[0].id, year=year, is_active=1).one()
     transfer_allowance(
         db,
         elec_account,
-        float(elec_record.deficit),
+        float(elec_record.deficit) + 1000,
         "buy",
         counterparty="碳市场",
         tx_date=f"{year}-12-20",
     )
     clear_emission(db, companies[0].id, year, f"{year}-12-31")
+    # 恒固水泥排放量低于配额，批准冻结即足额，清缴后富余可对外出让
     clear_emission(db, companies[1].id, year, f"{year}-12-31")
+
+    # 企业间交易演示：恒固水泥（卖方，清缴后有富余）向绿能电力（买方）
+    # 协议出让 1000 吨配额。卖方发起即交易占用，买方确认后交割，双方各生成一笔成交流水。
+    trade = create_order(
+        db,
+        seller_company_id=companies[1].id,
+        buyer_company_id=companies[0].id,
+        year=year,
+        amount=1000,
+        unit_price=78.5,
+        trade_date=f"{year}-12-28",
+        remark="年度履约期企业间协议转让",
+        creator_company_id=companies[1].id,
+    )
+    confirm_order(db, trade.id, companies[0].id)
+    deliver_order(db, trade.id, companies[1].id)
 
     db.commit()
     db.close()
-    print("初始化完成：2 家企业、4 个核算边界、3 个排放因子、4 条活动数据（2025）、2 份配额、2 份已批准 MRV 报告、2 条履约记录（含 1 次缺口补缴）")
+    print("初始化完成：2 家企业、4 个核算边界、3 个排放因子、4 条活动数据（2025）、2 份配额、2 份已批准 MRV 报告、2 条履约记录（含 1 次缺口补缴）、1 笔已交割企业间订单")
     print("账号：admin / verifier / elec / cement，密码均为 123456")
 
 

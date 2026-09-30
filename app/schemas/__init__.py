@@ -61,5 +61,23 @@ class TransferIn(BaseModel):
     idempotency_key: str | None = None
 
 
+class TradeOrderIn(BaseModel):
+    seller_company_id: int
+    buyer_company_id: int
+    year: int
+    amount: float = Field(gt=0)
+    unit_price: float | None = Field(default=None, ge=0)
+    trade_date: str = ""
+    remark: str = ""
+    # 监管代发起时指定发起方企业（创建即确认该方）；企业发起时由服务端强制为本企业
+    creator_company_id: int | None = None
+    # 下单幂等键（也可用 Idempotency-Key 请求头）：重复提交只生成一张订单
+    idempotency_key: str | None = None
+
+
+class TradeOrderCancelIn(BaseModel):
+    reason: str = Field(default="", max_length=256)
+
+
 class ReportReversalIn(BaseModel):
     reason: str = Field(min_length=2, max_length=500)
